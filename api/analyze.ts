@@ -16,6 +16,54 @@ function getAiClient(): GoogleGenAI {
   return aiClient;
 }
 
+// Resilient helper to call Gemini with retries and multiple fallback model variations
+async function generateDecisionAnalysis(ai: GoogleGenAI, prompt: string, responseSchema: any) {
+  const models = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"];
+  let lastError: any = null;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`[Gemini API] Attempting analysis using model "${model}" (attempt ${attempt}/2)...`);
+        const response = await ai.models.generateContent({
+          model: model,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema,
+            temperature: 0.2,
+          },
+        });
+
+        if (response && response.text) {
+          console.log(`[Gemini API] Success using model "${model}" on attempt ${attempt}.`);
+          return response;
+        }
+      } catch (error: any) {
+        lastError = error;
+        console.warn(
+          `[Gemini API] Model "${model}" failed on attempt ${attempt} with error:`,
+          error?.message || error
+        );
+
+        // Don't retry if it's a 400 (e.g. invalid options/request inputs) or 403 (invalid API Key)
+        const status = error?.status || error?.code || (error?.response ? error?.response?.status : null);
+        if (status === 400 || status === 403) {
+          break; // Break current attempt loop, will proceed to next model or throw
+        }
+
+        if (attempt < 2) {
+          // Exponential backoff
+          const waitTime = attempt * 1000;
+          await new Promise((resolve) => setTimeout(resolve, waitTime));
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("Failed to generate content with any of the available Gemini models.");
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed. Use POST." });
@@ -132,15 +180,7 @@ Please ensure the items have unique IDs, and that all descriptions are objective
       required: ["title", "overview", "options", "optionsAnalysis", "comparisonTable", "verdict"]
     };
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: responseSchema,
-        temperature: 0.2, 
-      }
-    });
+    const response = await generateDecisionAnalysis(ai, prompt, responseSchema);
 
     try {
       const parsedData = JSON.parse(response.text || "{}");
